@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.agents/memory/session-logs/*/
+!.agents/memory/session-logs/INDEX.md
+!.agents/memory/session-logs/.gitignore

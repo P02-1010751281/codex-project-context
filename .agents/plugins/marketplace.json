@@ -1,0 +1,20 @@
+{
+  "name": "codex-project-context-local",
+  "interface": {
+    "displayName": "Codex Project Context Local"
+  },
+  "plugins": [
+    {
+      "name": "codex-project-context",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
