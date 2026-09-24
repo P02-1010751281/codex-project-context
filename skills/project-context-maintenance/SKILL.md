@@ -21,6 +21,10 @@ python3 "$PLUGIN_ROOT/scripts/contextctl.py" apply-maintenance \
 
 The result must use `schema: "project-context/2"`.
 
+`MEMORY.md` is a bounded projection, not the session archive. Keep durable facts concise; the
+plugin applies the project `maxMemoryChars` cap at write time, cuts only at line boundaries, and
+leaves an explicit truncation marker. The raw session log remains the source for details.
+
 For consolidation:
 
 ```json

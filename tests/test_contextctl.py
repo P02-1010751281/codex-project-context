@@ -328,6 +328,27 @@ class ContextCtlTests(unittest.TestCase):
         finally:
             ctl.MEMORY_JOURNAL_ROTATE_BYTES = old_limit
 
+    def test_memory_cap_is_configurable_line_bounded_and_explicit(self):
+        (ctl.memory_root(self.root) / "project-context.json").write_text(json.dumps({"maxMemoryChars": 4_000}))
+        request = self.root / "request.json"
+        request.write_text(json.dumps({"status": "pending", "request_id": "cap-1"}))
+        result = self.root / "result.json"
+        memory = "\n".join(f"- fact {index}: durable context" for index in range(400)) + "\nTAIL_SENTINEL"
+        result.write_text(json.dumps({
+            "schema": "project-context/2",
+            "memory_markdown": memory,
+            "context": {"title": "T", "summary": "S", "key_points": [], "open_tasks": []},
+        }))
+
+        ctl.apply_maintenance(self.root, request, result)
+        rendered = (ctl.memory_root(self.root) / "MEMORY.md").read_text()
+        self.assertRegex(rendered, r"_\[memory truncated at 4000 characters: \d+ dropped\]_$")
+        self.assertNotIn("TAIL_SENTINEL", rendered)
+        content_before_marker = rendered.split("\n\n_[memory truncated", 1)[0]
+        self.assertLessEqual(len(content_before_marker), 4_000)
+        self.assertEqual(rendered, ctl.normalize_memory_document(rendered, 4_000))
+        self.assertEqual(rendered, ctl.load_memory_document(self.root))
+
     def test_hook_wrapper_returns_json_and_writes_project_state(self):
         self.transcript.write_bytes(b"{opaque:true}\n")
         wrapper = Path(__file__).resolve().parents[1] / "hooks" / "context_hook.py"

@@ -28,7 +28,10 @@ from typing import Any, Iterator
 
 
 SCHEMA = "project-context/2"
-MAX_MEMORY_CHARS = 24_000
+MAX_MEMORY_CHARS = 32_000
+MIN_MEMORY_CHARS = 4_000
+MAX_MEMORY_CHARS_LIMIT = 200_000
+MEMORY_TRUNCATION_LINE = re.compile(r"^_\[memory truncated at \d+ characters: \d+ dropped\]_$")
 MEMORY_JOURNAL_ROTATE_BYTES = 512 * 1024
 MEMORY_BACKUPS_KEPT = 5
 MEMORY_BACKUPS_MAX = 20
@@ -52,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "codexHookEnabled": True,
     "maintenanceMode": "stop-continuation",
     "maxInjectedChars": 12_000,
+    "maxMemoryChars": MAX_MEMORY_CHARS,
 }
 
 
@@ -150,6 +154,13 @@ def load_config(root: Path) -> dict[str, Any]:
     return result
 
 
+def memory_limit(root: Path) -> int:
+    value = load_config(root).get("maxMemoryChars", MAX_MEMORY_CHARS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return MAX_MEMORY_CHARS
+    return max(MIN_MEMORY_CHARS, min(MAX_MEMORY_CHARS_LIMIT, value))
+
+
 def ensure_memory_gitignore(root: Path) -> None:
     path = memory_root(root) / ".gitignore"
     lines = [
@@ -159,6 +170,7 @@ def ensure_memory_gitignore(root: Path) -> None:
         "memory-log-*.jsonl",
         "errors.log",
         "*.lock",
+        "*.steal",
         "*.tmp",
         "*.broken-*",
         ".maintenance-transaction.json",
@@ -321,14 +333,32 @@ def read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
-def normalize_memory_document(value: str) -> str:
+def memory_truncation_marker(dropped: int, limit: int) -> str:
+    return f"_[memory truncated at {limit} characters: {dropped} dropped]_"
+
+
+def _clip_to_line_boundary(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = text[: max(0, limit)]
+    cut = head.rfind("\n")
+    return head[:cut] if cut > 0 else head
+
+
+def normalize_memory_document(value: str, limit: int = MAX_MEMORY_CHARS) -> str:
     body = value.strip()
     body = re.sub(r"^```(?:markdown|md)?\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"\s*```$", "", body).strip()
     body = re.sub(r"^#\s*Project Memory\s*", "", body, count=1, flags=re.IGNORECASE).strip()
-    if len(body) > MAX_MEMORY_CHARS:
-        body = body[:MAX_MEMORY_CHARS].rstrip()
-    return f"# Project Memory\n\n{body}\n" if body else "# Project Memory\n"
+    lines = body.splitlines()
+    previous = next((line.strip() for line in lines if MEMORY_TRUNCATION_LINE.fullmatch(line.strip())), None)
+    body = "\n".join(line for line in lines if not MEMORY_TRUNCATION_LINE.fullmatch(line.strip())).strip()
+    document = f"# Project Memory\n\n{body}"
+    if len(document) <= limit:
+        suffix = f"\n\n{previous}" if previous else ""
+        return f"{document}{suffix}".rstrip() + "\n"
+    kept = _clip_to_line_boundary(document, limit).rstrip()
+    return f"{kept}\n\n{memory_truncation_marker(len(document) - len(kept), limit)}\n"
 
 
 def _poison_prefix_is_safe(prefix: str) -> bool:
@@ -340,7 +370,7 @@ def _poison_prefix_is_safe(prefix: str) -> bool:
     return not re.search(r"[*_#`>|\-\[\]]", value[:-1])
 
 
-def decode_poisoned_memory(value: str) -> str | None:
+def decode_poisoned_memory(value: str, limit: int = MAX_MEMORY_CHARS) -> str | None:
     """Recover a prior consolidation reply accidentally stored as MEMORY.md."""
     body = re.sub(r"^#\s*Project Memory\s*", "", value.strip(), count=1, flags=re.IGNORECASE)
     object_at = body.find("{")
@@ -363,7 +393,7 @@ def decode_poisoned_memory(value: str) -> str | None:
         not canonical_prefix or len(decoded) < 120 or "\n" not in decoded
     ):
         return None
-    return normalize_memory_document(decoded)
+    return normalize_memory_document(decoded, limit)
 
 
 def _memory_record(op: str, text: str) -> bytes:
@@ -409,14 +439,14 @@ def read_memory_journal(path: Path) -> dict[str, Any]:
     return state
 
 
-def fold_memory_journal(entries: list[dict[str, str]]) -> str:
+def fold_memory_journal(entries: list[dict[str, str]], limit: int = MAX_MEMORY_CHARS) -> str:
     document = ""
     for entry in entries:
         text = entry["text"].strip()
         if not text:
             continue
         document = text if entry["op"] == "replace" else (f"{document}\n\n{text}" if document else text)
-    return normalize_memory_document(document) if document else ""
+    return normalize_memory_document(document, limit) if document else ""
 
 
 def _read_memory_render(root: Path) -> bytes:
@@ -426,15 +456,16 @@ def _read_memory_render(root: Path) -> bytes:
         return b""
 
 
-def _decode_memory_render(raw: bytes) -> str:
+def _decode_memory_render(raw: bytes, limit: int = MAX_MEMORY_CHARS) -> str:
     if not raw.strip():
         return ""
     text = raw.decode("utf-8")
-    return decode_poisoned_memory(text) or normalize_memory_document(text)
+    return decode_poisoned_memory(text, limit) or normalize_memory_document(text, limit)
 
 
-def load_memory_document(root: Path) -> str:
+def load_memory_document(root: Path, limit: int | None = None) -> str:
     """Read the journal projection, falling back to legacy MEMORY.md when needed."""
+    limit = memory_limit(root) if limit is None else limit
     try:
         assert_safe_project_path(root, memory_file(root))
         assert_safe_project_path(root, memory_journal_file(root))
@@ -445,18 +476,18 @@ def load_memory_document(root: Path) -> str:
     if state["unreadable"] or (state["damaged"] and not state["entries"]):
         return ""
     if state["entries"]:
-        folded = fold_memory_journal(state["entries"])
+        folded = fold_memory_journal(state["entries"], limit)
         try:
             render = _read_memory_render(root)
             if render.strip() and journal.exists() and memory_file(root).stat().st_mtime > journal.stat().st_mtime:
-                external = _decode_memory_render(render)
+                external = _decode_memory_render(render, limit)
                 if external and external != folded:
                     return external
         except OSError:
             pass
         return folded
     try:
-        return _decode_memory_render(_read_memory_render(root))
+        return _decode_memory_render(_read_memory_render(root), limit)
     except (OSError, UnicodeDecodeError):
         return ""
 
@@ -487,7 +518,7 @@ def _prune_memory_backups(root: Path) -> None:
             pass
 
 
-def backup_memory_before_write(root: Path) -> tuple[Path | None, bool]:
+def backup_memory_before_write(root: Path, limit: int = MAX_MEMORY_CHARS) -> tuple[Path | None, bool]:
     """Keep the exact current MEMORY.md bytes; an unreadable file fails closed."""
     path = memory_file(root)
     try:
@@ -497,7 +528,7 @@ def backup_memory_before_write(root: Path) -> tuple[Path | None, bool]:
     if not raw:
         return None, False
     # Decode before replacing so a binary/unreadable MEMORY.md is never overwritten.
-    poisoned = bool(decode_poisoned_memory(raw.decode("utf-8")))
+    poisoned = bool(decode_poisoned_memory(raw.decode("utf-8"), limit))
     ensure_memory_gitignore(root)
     backup = memory_root(root) / f"MEMORY.md.memory-backup-{_artifact_stamp()}-{uuid.uuid4().hex[:8]}"
     atomic_write(backup, raw)
@@ -505,19 +536,20 @@ def backup_memory_before_write(root: Path) -> tuple[Path | None, bool]:
     return backup, poisoned
 
 
-def prepare_memory_write(root: Path, text: str) -> tuple[str, bytes, Path | None, bool, int]:
-    normalized = normalize_memory_document(text)
+def prepare_memory_write(root: Path, text: str, limit: int | None = None) -> tuple[str, bytes, Path | None, bool, int]:
+    limit = memory_limit(root) if limit is None else limit
+    normalized = normalize_memory_document(text, limit)
     journal = memory_journal_file(root)
     state = read_memory_journal(journal)
     if state["unreadable"] or (state["damaged"] and not state["entries"]):
         raise ValueError(f"memory journal exists but has no usable records: {journal}")
     render = _read_memory_render(root)
-    backup, poisoned = backup_memory_before_write(root)
+    backup, poisoned = backup_memory_before_write(root, limit)
     journal_raw = state["raw"] if state["exists"] else b""
     if state["entries"]:
-        folded = fold_memory_journal(state["entries"])
+        folded = fold_memory_journal(state["entries"], limit)
         if render.strip():
-            external = _decode_memory_render(render)
+            external = _decode_memory_render(render, limit)
             try:
                 is_newer = memory_file(root).stat().st_mtime > journal.stat().st_mtime
             except OSError:
@@ -525,7 +557,7 @@ def prepare_memory_write(root: Path, text: str) -> tuple[str, bytes, Path | None
             if external and external != folded and is_newer:
                 journal_raw = _append_memory_record(journal_raw, "replace", external)
     elif render.strip():
-        journal_raw = _append_memory_record(journal_raw, "replace", _decode_memory_render(render))
+        journal_raw = _append_memory_record(journal_raw, "replace", _decode_memory_render(render, limit))
     journal_raw = _append_memory_record(journal_raw, "replace", normalized)
     return normalized, journal_raw, backup, poisoned, int(state["damaged"])
 
@@ -539,7 +571,7 @@ def rotate_memory_journal(root: Path) -> None:
     if len(raw) <= MEMORY_JOURNAL_ROTATE_BYTES:
         return
     state = read_memory_journal(path)
-    folded = fold_memory_journal(state["entries"]) if state["entries"] else ""
+    folded = fold_memory_journal(state["entries"], memory_limit(root)) if state["entries"] else ""
     if state["unreadable"] or not folded:
         return
     archive = memory_root(root) / f"memory-log-{_artifact_stamp()}-{uuid.uuid4().hex[:8]}.jsonl"
@@ -572,7 +604,7 @@ def seed_memory_journal(root: Path) -> None:
         raw = _read_memory_render(root)
         if not raw.strip():
             return
-        text = _decode_memory_render(raw)
+        text = _decode_memory_render(raw, memory_limit(root))
         ensure_memory_gitignore(root)
         atomic_write(journal, _memory_record("replace", text))
     except (OSError, UnicodeDecodeError, ValueError) as error:
@@ -1426,7 +1458,7 @@ def validate_maintenance(value: Any, root: Path) -> str:
     if set(value) != {"schema", "memory_markdown", "context"}:
         raise ValueError("unknown consolidation field")
     context = value.get("context")
-    if not isinstance(value.get("memory_markdown"), str) or len(value["memory_markdown"]) > MAX_MEMORY_CHARS:
+    if not isinstance(value.get("memory_markdown"), str) or len(value["memory_markdown"]) > MAX_MEMORY_CHARS_LIMIT:
         raise ValueError("invalid memory_markdown")
     if not isinstance(context, dict) or set(context) != {"title", "summary", "key_points", "open_tasks"}:
         raise ValueError("invalid context object")
@@ -1461,7 +1493,9 @@ def _apply_maintenance_locked(root: Path, request_path: Path, input_path: Path) 
         context_text += f"## {context['title']}\n\n{context['summary']}\n\n"
         context_text += "## Key points\n\n" + "\n".join(f"- {item}" for item in context["key_points"]) + "\n\n"
         context_text += "## Open tasks\n\n" + "\n".join(f"- {item}" for item in context["open_tasks"]) + "\n"
-        memory_text, journal_text, backup, poisoned, damaged = prepare_memory_write(root, value["memory_markdown"])
+        memory_text, journal_text, backup, poisoned, damaged = prepare_memory_write(
+            root, value["memory_markdown"], memory_limit(root)
+        )
         outputs = [
             (memory_journal_file(root), journal_text),
             (memory_file(root), memory_text),

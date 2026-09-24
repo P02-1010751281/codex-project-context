@@ -1,6 +1,6 @@
 {
   "name": "codex-project-context",
-  "version": "0.3.0",
+  "version": "0.4.0+codex.20260922113832",
   "description": "Project-local context, memory, session archive, migration, and handoff for Codex.",
   "author": {
     "name": "Local developer"
@@ -12,7 +12,10 @@
     "longDescription": "Codex Project Context preserves hook-visible sessions, injects bounded project memory, migrates Pi context, and schedules model-assisted maintenance.",
     "developerName": "Local developer",
     "category": "Productivity",
-    "capabilities": ["hooks", "skills"],
+    "capabilities": [
+      "hooks",
+      "skills"
+    ],
     "defaultPrompt": "Use the project context files and session archive for this project."
   }
 }

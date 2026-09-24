@@ -44,6 +44,8 @@ Codex hook stdin
 
 记忆层与 Pi 保持同一数据流：`memory.jsonl` 是 append-only 记录源，`MEMORY.md` 是可重建渲染。每次 maintenance 写入前保留原始 `MEMORY.md` 字节；旧版本误写入的 JSON consolidation reply 会在内存中恢复并把原文件留作备份。journal 存在不可恢复的损坏时 fail closed，不覆盖现有记忆；可识别的损坏记录会保留并写入 `errors.log`。
 
+`maxMemoryChars` 控制渲染后的长期记忆上限，默认 32,000 字符，可在 `.agents/memory/project-context.json` 中配置（4,000–200,000）。超限时按整行截断并在末尾写入 `_[memory truncated at ...]_` marker；session 原始归档和工具数据不受此投影上限影响。
+
 插件也提供一次性历史补救导入：`import-codex` 会读取 Codex 本地 `sessions/`/`archived_sessions/` 中的原生 rollout JSONL，依据首个 `session_meta.cwd` 路由到项目，并以不解析 schema 的原始分块写入项目归档。它会保留原生文件中已有的系统提示词、工具调用/结果等字节，但这些内容只作为原始证据，不会被当作当前 hook 能力的承诺；没有可靠项目 cwd 的临时 rollout 会跳过。
 
 哈希只用于三件事：判断 transcript 是追加还是重写、对原始 payload 去重、让 Pi 迁移幂等。不会建立目录树 digest，也不把它当作安全认证。
