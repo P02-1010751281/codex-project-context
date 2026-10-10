@@ -10,9 +10,9 @@
 Codex hook stdin
   -> .agents/memory/session-logs/<session-id>/session.jsonl
   -> session.md + INDEX.md
-  -> SessionStart 有界注入 CONTEXT/MEMORY/active skills
+  -> SessionStart 注入 CONTEXT/MEMORY（常驻小节 + 其余小节指针）+ active skills
   -> Stop 触发当前 Codex 继续轮次执行 maintenance skill
-  -> CONTEXT.md / memory.jsonl -> MEMORY.md / skills / HANDOFF.md
+  -> memory 四节 / CONTEXT 三节 -> CONTEXT.md + memory.jsonl -> MEMORY.md / skills / HANDOFF.md
 ```
 
 运行期状态写入使用插件的项目根目录（优先 Git root）：
@@ -44,7 +44,25 @@ Codex hook stdin
 
 记忆层与 Pi 保持同一数据流：`memory.jsonl` 是 append-only 记录源，`MEMORY.md` 是可重建渲染。每次 maintenance 写入前保留原始 `MEMORY.md` 字节；旧版本误写入的 JSON consolidation reply 会在内存中恢复并把原文件留作备份。journal 存在不可恢复的损坏时 fail closed，不覆盖现有记忆；可识别的损坏记录会保留并写入 `errors.log`。
 
-`maxMemoryChars` 控制渲染后的长期记忆上限，默认 32,000 字符，可在 `.agents/memory/project-context.json` 中配置（4,000–200,000）。超限时按整行截断并在末尾写入 `_[memory truncated at ...]_` marker；session 原始归档和工具数据不受此投影上限影响。
+### 记忆与上下文的结构
+
+`MEMORY.md` 的四个小节由代码拥有，模型只填条目：`## Project`（定位、栈、结构）、`## Invariants`（长期决定、约定、硬约束、用户偏好）、`## Pitfalls`（操作陷阱与背后的教训）、`## Index`（文档/源码/命令指针）。每节有一个 share，但 share 是**目标值**不是上限：某节用不完的额度汇成池，分给超出目标的节，只有整个文档到达 cap 才丢条目。条目丢失时文档末尾会带一行 `_[memory entries dropped at the document cap]_`，计数与被丢条目样本写进 `errors.log`。
+
+`CONTEXT.md` 同样固定三节：`## Summary` / `## Key points` / `## Open tasks`，逐节预算、超限按整行截断并在末尾写 `_[context truncated: N characters dropped]_`。
+
+维护 pass 用结构化 `memory` 字段提交（`{"project": [...], "invariants": [...], "pitfalls": [...], "index": [...]}`）；旧的 `memory_markdown` 仍然接受，会按自由格式文档渲染。
+
+`maxMemoryChars` 控制渲染后的长期记忆上限，默认 32,000 字符，可在 `.agents/memory/project-context.json` 中配置（4,000–200,000）。自由格式记忆超限时按整行截断、**保留头尾并丢掉中段**，再写入 `_[memory truncated at ...]_` marker；session 原始归档和工具数据不受此投影上限影响。
+
+### 注入是渐进披露
+
+每轮注入不再整篇搬运两个文件：`MEMORY.md` 只常驻 `## Invariants` 与 `## Pitfalls`（答错就违规、或重犯已修 bug 的两节），`## Project` 与 `## Index` 压成一行「文件 + 节名 + 何时读它」的指针；`CONTEXT.md` 常驻 `## Key points` 与 `## Open tasks`，`## Summary` 走指针。指针块后面跟一条强指令：涉及本项目具体事实而不确定时，先 read 该文件再回答。
+
+小节划分只按渲染 schema 的标题，不按语义分类，所以不会有一处分类悄悄错掉：未知小节、没有可用标题的文档整篇注入，schema 变化时退化为旧行为而不是丢内容。指针语言跟随正文语言（CJK ≥ 2 判中文）。
+
+### 技能来源与覆盖
+
+维护 pass 写出的 `SKILL.md` 在正文里带一行 `<!-- autolearn-generated: ... -->`（与 pi、dsh 同一拼写）。后续 pass 只能覆盖带这个标记的技能：同名的手写技能会被拒绝并保持原样，错误写进 `errors.log`。标记随文件生灭，所以删除后名字被手写技能占用不会被误当成自家的产物。
 
 插件也提供一次性历史补救导入：`import-codex` 会读取 Codex 本地 `sessions/`/`archived_sessions/` 中的原生 rollout JSONL，依据首个 `session_meta.cwd` 路由到项目，并以不解析 schema 的原始分块写入项目归档。它会保留原生文件中已有的系统提示词、工具调用/结果等字节，但这些内容只作为原始证据，不会被当作当前 hook 能力的承诺；没有可靠项目 cwd 的临时 rollout 会跳过。
 

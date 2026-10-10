@@ -28,10 +28,55 @@ from typing import Any, Iterator
 
 
 SCHEMA = "project-context/2"
+
+# The memory document's fixed schema. Code owns the headings, their order and their shares; the pass
+# only supplies the entries. A memory that does not follow the schema still loads and renders: the
+# schema is what the pass asks for, not a gate on what is already stored.
+MEMORY_HEADER = "# Project Memory\n\n"
+MEMORY_SECTIONS = (
+    {"heading": "Project", "field": "project", "share": 0.20},
+    {"heading": "Invariants", "field": "invariants", "share": 0.40},
+    {"heading": "Pitfalls", "field": "pitfalls", "share": 0.25},
+    {"heading": "Index", "field": "index", "share": 0.15},
+)
+
+# CONTEXT.md's fixed schema, and the cap its own sections are budgeted against.
+CONTEXT_HEADER = "# Project Context\n\n"
+CONTEXT_SECTIONS = (
+    {"heading": "Summary", "field": "summary", "share": 0.40, "max_chars": 6_000},
+    {"heading": "Key points", "field": "key_points", "share": 0.35},
+    {"heading": "Open tasks", "field": "open_tasks", "share": 0.25},
+)
+MAX_CONTEXT_CHARS = 32_000
+CONTEXT_TITLE_CHARS = 160
+MAX_LIST_ITEMS = 50
+MAX_LIST_ITEM_CHARS = 800
+
 MAX_MEMORY_CHARS = 32_000
 MIN_MEMORY_CHARS = 4_000
 MAX_MEMORY_CHARS_LIMIT = 200_000
 MEMORY_TRUNCATION_LINE = re.compile(r"^_\[memory truncated at \d+ characters: \d+ dropped\]_$")
+MEMORY_DROP_NOTE = "_[memory entries dropped at the document cap]_"
+DOCUMENT_NOTE_RE = re.compile(r"^_\[[^\]]+\]_$")
+
+# A section that needs less than its target leaves the rest in a pool; the sections over their target
+# draw from it. Only the document cap drops an entry, never a section's own share.
+BULLET_OVERHEAD_CHARS = 3
+MIN_SECTION_BUDGET_CHARS = 8
+DROPPED_SAMPLE_LIMIT = 3
+DROPPED_SAMPLE_CHARS = 72
+CLIP_HEAD_SHARE = 0.6
+
+# Skills this plugin writes carry a provenance marker in their body, so a later pass may supersede its
+# own output and nothing else. The same spelling pi and dsh use, so the marker means one thing across
+# the agents that share a project directory.
+AUTOLEARN_PROVENANCE = "<!-- autolearn-generated: this skill may be superseded by a later maintenance pass -->"
+AUTOLEARN_PROVENANCE_RE = re.compile(r"<!--\s*autolearn-generated[^>]*-->")
+
+# The CJK threshold the injected pointer lines are written in the language of the document they point at.
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+LANGUAGE_CJK_MIN = 2
+
 MEMORY_JOURNAL_ROTATE_BYTES = 512 * 1024
 MEMORY_BACKUPS_KEPT = 5
 MEMORY_BACKUPS_MAX = 20
@@ -337,7 +382,12 @@ def memory_truncation_marker(dropped: int, limit: int) -> str:
     return f"_[memory truncated at {limit} characters: {dropped} dropped]_"
 
 
-def _clip_to_line_boundary(text: str, limit: int) -> str:
+def context_truncation_marker(dropped: int) -> str:
+    return f"_[context truncated: {dropped} characters dropped]_"
+
+
+def clip_to_line_boundary(text: str, limit: int) -> str:
+    """Largest whole-line prefix of `text` within `limit`; only a single over-long line is cut inside."""
     if len(text) <= limit:
         return text
     head = text[: max(0, limit)]
@@ -345,7 +395,43 @@ def _clip_to_line_boundary(text: str, limit: int) -> str:
     return head[:cut] if cut > 0 else head
 
 
+def _clip_tail_to_line_boundary(text: str, limit: int) -> str:
+    """Largest whole-line suffix of `text` within `limit`; mirror of the head clipper."""
+    if len(text) <= limit:
+        return text
+    tail = text[len(text) - max(0, limit) :]
+    cut = tail.find("\n")
+    return tail[cut + 1 :] if cut >= 0 else tail
+
+
+def clip_to_line_boundary_both_ends(text: str, limit: int) -> str:
+    """Largest head AND tail of `text` that together fit `limit`, joined across the drop.
+
+    A head-only clip dropped whatever sat at the end - in this project's memories the last section
+    holds the durable operating lessons - while a large early section stayed. Keeping both ends
+    preserves the opening facts and the closing lessons and drops the middle instead.
+    """
+    if len(text) <= limit:
+        return text
+    head = clip_to_line_boundary(text, max(0, int(limit * CLIP_HEAD_SHARE))).rstrip()
+    tail_budget = limit - len(head) - 1
+    if tail_budget <= 0:
+        return head
+    tail = _clip_tail_to_line_boundary(text[len(head) :], tail_budget).lstrip()
+    return f"{head}\n{tail}" if tail else head
+
+
+def _strip_memory_marker(value: str) -> str:
+    return "\n".join(line for line in value.split("\n") if not MEMORY_TRUNCATION_LINE.fullmatch(line.strip()))
+
+
 def normalize_memory_document(value: str, limit: int = MAX_MEMORY_CHARS) -> str:
+    """Rebuild the `# Project Memory` document from a stored or recovered value.
+
+    Over the cap the body keeps its head and its tail, joined across the drop, and the document gets
+    an explicit marker: a cut memory must never look like a complete one. Normalizing twice is
+    idempotent, and a marker left by an earlier clip is preserved verbatim.
+    """
     body = value.strip()
     body = re.sub(r"^```(?:markdown|md)?\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"\s*```$", "", body).strip()
@@ -353,12 +439,24 @@ def normalize_memory_document(value: str, limit: int = MAX_MEMORY_CHARS) -> str:
     lines = body.splitlines()
     previous = next((line.strip() for line in lines if MEMORY_TRUNCATION_LINE.fullmatch(line.strip())), None)
     body = "\n".join(line for line in lines if not MEMORY_TRUNCATION_LINE.fullmatch(line.strip())).strip()
-    document = f"# Project Memory\n\n{body}"
+    document = f"{MEMORY_HEADER}{body}"
     if len(document) <= limit:
         suffix = f"\n\n{previous}" if previous else ""
         return f"{document}{suffix}".rstrip() + "\n"
-    kept = _clip_to_line_boundary(document, limit).rstrip()
+    budget = max(0, limit - len(MEMORY_HEADER))
+    kept_body = _strip_memory_marker(clip_to_line_boundary_both_ends(body, budget)).strip()
+    kept = f"{MEMORY_HEADER}{kept_body}"
     return f"{kept}\n\n{memory_truncation_marker(len(document) - len(kept), limit)}\n"
+
+
+def normalize_memory_reply(value: str, limit: int = MAX_MEMORY_CHARS) -> str:
+    """Normalize a fresh reply. A marker copied out of the stored render describes an older clip."""
+    return normalize_memory_document(_strip_memory_marker(value), limit)
+
+
+def document_language(text: str) -> str:
+    """Language of a document, for pointer lines that must sit in the language of the body they point at."""
+    return "zh" if len(CJK_RE.findall(text)) >= LANGUAGE_CJK_MIN else "en"
 
 
 def _poison_prefix_is_safe(prefix: str) -> bool:
@@ -447,6 +545,275 @@ def fold_memory_journal(entries: list[dict[str, str]], limit: int = MAX_MEMORY_C
             continue
         document = text if entry["op"] == "replace" else (f"{document}\n\n{text}" if document else text)
     return normalize_memory_document(document, limit) if document else ""
+
+
+def memory_schema_overhead_chars() -> int:
+    """What the fixed layout reserves before any entry is written (deliberately conservative)."""
+    return len(MEMORY_HEADER) + sum(len(f"## {section['heading']}\n\n") + 2 for section in MEMORY_SECTIONS)
+
+
+def memory_structure_overhead_chars() -> int:
+    """What the rendered layout spends exactly: header, headings, and one blank line between them."""
+    headings = sum(len(f"## {section['heading']}\n") for section in MEMORY_SECTIONS)
+    return len(MEMORY_HEADER) + headings + (len(MEMORY_SECTIONS) - 1)
+
+
+def memory_section_budgets(limit: int) -> list[dict[str, Any]]:
+    body = max(0, limit - memory_schema_overhead_chars())
+    return [{**section, "chars": int(body * section["share"])} for section in MEMORY_SECTIONS]
+
+
+def _allocation_for(targets: list[int], wanted: list[int], body: int) -> list[int]:
+    """What each section may spend: its target, plus a proportional share of what the others left.
+
+    The per-section numbers are targets, not caps - the document cap is the only hard limit. Charging
+    the pool from the targets themselves would leave structurally unused characters that then get
+    spent as dropped entries, which is the field case this rule exists to prevent.
+    """
+    allowed = [min(need, target) for need, target in zip(wanted, targets)]
+    pool = body - sum(allowed)
+    over = [max(0, need - target) for need, target in zip(wanted, targets)]
+    over_total = sum(over)
+    if pool <= 0 or over_total == 0:
+        return allowed
+    extra = [0 if need == 0 else min(need, (pool * need) // over_total) for need in over]
+    return [value + bonus for value, bonus in zip(allowed, extra)]
+
+
+def memory_entries(values: Any) -> list[str]:
+    """One entry per bullet: whitespace collapsed (an embedded newline cannot forge a heading), no bullet
+    prefix, and nothing that carries only symbols or formatting."""
+    if not isinstance(values, list):
+        return []
+    entries: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        entry = re.sub(r"^-\s+", "", re.sub(r"\s+", " ", value).strip()).strip()
+        if any(char.isalnum() for char in entry):
+            entries.append(entry)
+    return entries
+
+
+def _render_memory_sections(sections: dict[str, Any], limit: int) -> tuple[str, int, list[str]]:
+    """Render the four sections without a drop note, so the caller can retry with the note's cost."""
+    budgets = memory_section_budgets(limit)
+    entries = [memory_entries(sections.get(section["field"])) for section in MEMORY_SECTIONS]
+    allowed = _allocation_for(
+        [budget["chars"] for budget in budgets],
+        [sum(len(entry) + BULLET_OVERHEAD_CHARS for entry in group) for group in entries],
+        max(0, limit - memory_structure_overhead_chars()),
+    )
+    dropped = 0
+    samples: list[str] = []
+    rendered: list[str] = []
+    for budget, group, spent_limit in zip(budgets, entries, allowed):
+        if budget["chars"] < MIN_SECTION_BUDGET_CHARS:
+            # Unreachable at MIN_MEMORY_CHARS (the smallest share is far above this), but the heading is
+            # still written so the document keeps its four-section shape and stays readable.
+            dropped += len(group)
+            rendered.append(f"## {budget['heading']}\n")
+            continue
+        item_cap = max(1, min(MAX_LIST_ITEM_CHARS, spent_limit - BULLET_OVERHEAD_CHARS))
+        kept: list[str] = []
+        spent = 0
+        for entry in group:
+            clipped = clip_to_line_boundary(entry, item_cap)
+            cost = len(clipped) + BULLET_OVERHEAD_CHARS
+            if spent + cost > spent_limit:
+                # Whole-entry drop: a half entry reads as a fact while being unusable. Only reachable
+                # when the document's own cap is full, never because a neighbour left room.
+                dropped += 1
+                if len(samples) < DROPPED_SAMPLE_LIMIT:
+                    samples.append(clip_to_line_boundary(entry, DROPPED_SAMPLE_CHARS))
+                continue
+            spent += cost
+            kept.append(clipped)
+        rendered.append(f"## {budget['heading']}\n" + "".join(f"- {entry}\n" for entry in kept))
+    return f"{MEMORY_HEADER}{chr(10).join(rendered)}".rstrip() + "\n", dropped, samples
+
+
+def render_memory_document(sections: dict[str, Any], limit: int) -> tuple[str, int, list[str]]:
+    """Render the four sections into the stored document, keeping the whole document within `limit`.
+
+    A document that had to drop entries carries a document-level note saying so: codex has no toast to
+    report the loss in, and a cut memory must not read as a complete one. The count and a sample of the
+    dropped entries go to `errors.log`; the note itself is kept out of the entries' budget.
+    """
+    text, dropped, samples = _render_memory_sections(sections, limit)
+    if dropped == 0:
+        return text, 0, []
+    note_cap = max(0, limit - len(MEMORY_DROP_NOTE) - 2)
+    reduced, reduced_dropped, reduced_samples = _render_memory_sections(sections, note_cap)
+    if reduced_dropped == 0:
+        return text, dropped, samples
+    return f"{reduced.rstrip()}\n\n{MEMORY_DROP_NOTE}\n", reduced_dropped, reduced_samples
+
+
+def context_schema_overhead_chars() -> int:
+    """Characters the fixed context layout spends before any section body.
+
+    Worst case on purpose: the header, the `Last updated` line, the three headings, the longest
+    trailing title comment, and room for the truncation marker.
+    """
+    stamp = len("Last updated: ") + len(now()) + 2
+    headings = sum(len(f"## {section['heading']}\n\n") + 2 for section in CONTEXT_SECTIONS)
+    trailing = len("<!-- latest-session-title: ") + CONTEXT_TITLE_CHARS + len(" -->\n")
+    marker = len(context_truncation_marker(MAX_CONTEXT_CHARS)) + 3
+    return len(CONTEXT_HEADER) + stamp + headings + trailing + marker
+
+
+def context_section_budgets(limit: int = MAX_CONTEXT_CHARS) -> dict[str, int]:
+    body = max(0, limit - context_schema_overhead_chars())
+    budgets: dict[str, int] = {}
+    for section in CONTEXT_SECTIONS:
+        chars = int(body * section["share"])
+        if section.get("max_chars") is not None:
+            chars = min(chars, int(section["max_chars"]))
+        budgets[str(section["field"])] = max(0, chars)
+    return budgets
+
+
+def _normalize_line(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _clip_context_list(items: Any, limit: int) -> tuple[list[str], int]:
+    """Clip a bullet list to its section budget: items trimmed, whole trailing items dropped."""
+    content = [line for line in (_normalize_line(item) for item in items or []) if line]
+    full = [f"- {item}" for item in content]
+    kept = [f"- {clip_to_line_boundary(item, MAX_LIST_ITEM_CHARS)}" for item in content][:MAX_LIST_ITEMS]
+    while len(kept) > 1 and len("\n".join(kept)) > limit:
+        kept = kept[:-1]
+    return kept, max(0, len("\n".join(full)) - len("\n".join(kept)))
+
+
+def render_context_document(context: dict[str, Any], limit: int = MAX_CONTEXT_CHARS) -> tuple[str, int]:
+    """Render CONTEXT.md from its fixed schema; a clipped document says how much it lost."""
+    budgets = context_section_budgets(limit)
+    title = clip_to_line_boundary(_normalize_line(context.get("title")), CONTEXT_TITLE_CHARS) or "Untitled session"
+    summary_source = _normalize_line(context.get("summary"))
+    summary = clip_to_line_boundary(summary_source, budgets["summary"])
+    key_points, key_dropped = _clip_context_list(context.get("key_points"), budgets["key_points"])
+    open_tasks, task_dropped = _clip_context_list(context.get("open_tasks"), budgets["open_tasks"])
+    rendered = {
+        "summary": summary or "No summary recorded yet.",
+        "key_points": "\n".join(key_points) or "- None recorded",
+        "open_tasks": "\n".join(open_tasks) or "- None recorded",
+    }
+    parts = [CONTEXT_HEADER.rstrip(), "", f"Last updated: {now()}", ""]
+    for section in CONTEXT_SECTIONS:
+        parts += [f"## {section['heading']}", "", rendered[str(section["field"])], ""]
+    parts.append(f"<!-- latest-session-title: {title} -->")
+    document = "\n".join(parts) + "\n"
+    dropped = (len(summary_source) - len(summary)) + key_dropped + task_dropped
+    if dropped > 0:
+        return f"{document.rstrip()}\n\n{context_truncation_marker(dropped)}\n", dropped
+    return document, 0
+
+
+def _scan_document(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """One fence-aware traversal: the preamble (before the first heading) and the `##` sections."""
+    preamble: list[str] = []
+    sections: list[dict[str, Any]] = []
+    fence: str | None = None
+    for line in text.split("\n"):
+        trimmed = line.strip()
+        run = re.match(r"^(`{3,}|~{3,})", trimmed)
+        if fence is None:
+            if run:
+                fence = run.group(1)
+        elif run and run.group(1)[0] == fence[0] and len(run.group(1)) >= len(fence) and not trimmed[len(run.group(1)) :].strip():
+            fence = None
+        match = re.match(r"^## (.+?)\s*$", line) if fence is None else None
+        if match:
+            sections.append({"heading": match.group(1), "lines": []})
+        elif sections:
+            sections[-1]["lines"].append(line)
+        else:
+            preamble.append(line)
+    return "\n".join(preamble).strip(), [
+        {"heading": section["heading"], "body": "\n".join(section["lines"]).strip()} for section in sections
+    ]
+
+
+# The keep/index split for the two documents injected every turn. MEMORY.md keeps the sections where a
+# wrong answer is a violation or a repeated lesson; CONTEXT.md keeps what the predecessor learned and
+# left open. Every other section costs one line naming the file instead of its whole body.
+MEMORY_INJECTION: dict[str, Any] = {
+    "path": ".agents/memory/MEMORY.md",
+    "keep": ["Invariants", "Pitfalls"],
+    "pointers": {
+        "Project": {
+            "zh": "模块布局与发布模型；需要结构性背景时读它。",
+            "en": "module layout and release model; read it when you need structural background.",
+        },
+        "Index": {
+            "zh": "文件→职责；定位「某功能在哪个文件」时读它。",
+            "en": "file → responsibility; read it to locate where a feature lives.",
+        },
+    },
+    "heading": {"zh": "其余小节在 `{path}`：", "en": "The remaining sections are in `{path}`:"},
+    "instruction": {
+        "zh": "凡涉及本项目的具体事实（字段名、路径、阈值、约束）而你不确定时，必须先 read 该文件再回答，不得凭印象作答。",
+        "en": "When a project fact (a field name, a path, a threshold, a constraint) decides the answer and you are not certain of it, read that file before answering instead of answering from impression.",
+    },
+}
+
+CONTEXT_INJECTION: dict[str, Any] = {
+    "path": ".agents/memory/CONTEXT.md",
+    "keep": ["Key points", "Open tasks"],
+    "pointers": {
+        "Summary": {
+            "zh": "本会话进程摘要；需要「之前发生过什么」时读它。",
+            "en": "what this session is about and where it stands; read it for what happened before this.",
+        },
+    },
+    "heading": {"zh": "其余小节在 `{path}`：", "en": "The remaining sections are in `{path}`:"},
+    "instruction": {
+        "zh": "凡涉及本项目或本会话的具体事实（字段名、路径、阈值、约束）而你不确定时，必须先 read 该文件再回答，不得凭印象作答。",
+        "en": "When a project or session fact (a field name, a path, a threshold, a constraint) decides the answer and you are not certain of it, read that file before answering instead of answering from impression.",
+    },
+}
+
+
+def render_progressive_body(text: str, spec: dict[str, Any], root: Path) -> str:
+    """Kept sections inline, indexed sections reduced to one read-first pointer each.
+
+    The split is by section, never by meaning: the headings come from the render schema. A document
+    with no usable heading is injected whole, so a schema change degrades to the previous behaviour
+    instead of dropping content, and a document-level note stays inline with the sections.
+    """
+    preamble, sections = _scan_document(text)
+    if not sections:
+        return text
+    language = document_language(text)
+    dash = "——" if language == "zh" else "—"
+    inline: list[str] = []
+    notes: list[str] = []
+    pointers: list[str] = []
+    for index, section in enumerate(sections):
+        lines = section["body"].split("\n")
+        note_lines = [line for line in lines if DOCUMENT_NOTE_RE.fullmatch(line.strip())] if index == len(sections) - 1 else []
+        notes.extend(line.strip() for line in note_lines)
+        body = "\n".join(line for line in lines if line not in note_lines).strip()
+        pointer = spec["pointers"].get(section["heading"])
+        if pointer:
+            pointers.append(f"- `## {section['heading']}` {dash} {pointer[language]}")
+        else:
+            inline.append(f"## {section['heading']}\n\n{body}".rstrip())
+    if not pointers:
+        return text
+    path = str(root / spec["path"])
+    parts = [
+        preamble,
+        *inline,
+        "\n".join(notes),
+        spec["heading"][language].replace("{path}", path),
+        "\n".join(pointers),
+        spec["instruction"][language],
+    ]
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def _read_memory_render(root: Path) -> bytes:
@@ -538,7 +905,9 @@ def backup_memory_before_write(root: Path, limit: int = MAX_MEMORY_CHARS) -> tup
 
 def prepare_memory_write(root: Path, text: str, limit: int | None = None) -> tuple[str, bytes, Path | None, bool, int]:
     limit = memory_limit(root) if limit is None else limit
-    normalized = normalize_memory_document(text, limit)
+    # The reply path drops a marker the model copied out of the stored render: it describes an older
+    # clip, and a fresh one is written below when this reply is itself over the cap.
+    normalized = normalize_memory_reply(text, limit)
     journal = memory_journal_file(root)
     state = read_memory_journal(journal)
     if state["unreadable"] or (state["damaged"] and not state["entries"]):
@@ -1119,20 +1488,25 @@ def prompt_count(session_dir: Path) -> int:
 def build_injection(root: Path, limit: int) -> str:
     ensure_layout(root)
     pieces: list[str] = []
-    files = [memory_root(root) / "CONTEXT.md", memory_root(root) / "MEMORY.md", memory_root(root) / "HANDOFF.md"]
     memory_document = load_memory_document(root)
     skills = sorted((root / ".agents" / "skills").glob("*/SKILL.md"))
-    for path in files:
+    files: list[tuple[Path, str, dict[str, Any] | None]] = [
+        (memory_root(root) / "CONTEXT.md", "", CONTEXT_INJECTION),
+        (memory_file(root), memory_document, MEMORY_INJECTION),
+        (memory_root(root) / "HANDOFF.md", "", None),
+    ]
+    for path, override, spec in files:
         if path.is_symlink():
             continue
-        if path == memory_file(root):
-            text = memory_document.strip()
-        else:
+        text = override.strip()
+        if not text:
             try:
                 text = path.read_text(encoding="utf-8").strip()
             except OSError:
                 text = ""
         if text:
+            if spec is not None:
+                text = render_progressive_body(text, spec, root)
             pieces.append(f"## {path.relative_to(root)}\n{text}")
     if skills:
         skill_lines = ["## Active project skills"]
@@ -1434,6 +1808,43 @@ def session_ids(root: Path) -> set[str]:
     return result
 
 
+def has_autolearn_provenance(text: str) -> bool:
+    """True when a `SKILL.md` carries this pipeline's provenance marker."""
+    return bool(AUTOLEARN_PROVENANCE_RE.search(text))
+
+
+def without_autolearn_provenance(text: str) -> str:
+    return AUTOLEARN_PROVENANCE_RE.sub("", text).lstrip()
+
+
+def with_autolearn_provenance(markdown: str) -> str:
+    """The stored `SKILL.md`: frontmatter, provenance marker, then the body.
+
+    The marker sits in the body rather than the frontmatter because the host injects only
+    name/description/path and treats unknown frontmatter keys as undefined.
+    """
+    body = without_autolearn_provenance(markdown).rstrip()
+    frontmatter = re.match(r"^---\n.*?\n---\n", body, flags=re.DOTALL)
+    if frontmatter:
+        return f"{frontmatter.group(0)}\n{AUTOLEARN_PROVENANCE}\n\n{body[frontmatter.end():].lstrip()}\n"
+    return f"{AUTOLEARN_PROVENANCE}\n\n{body}\n"
+
+
+def assert_skill_is_ours(path: Path) -> None:
+    """Refuse to overwrite a skill this pipeline did not write.
+
+    The marker is what makes "the pass may only supersede its own output" checkable on the artifact
+    itself: a name freed by a deletion and later taken by a hand-written skill carries no marker, so
+    it can never be mistaken for ours.
+    """
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return
+    if not has_autolearn_provenance(existing):
+        raise ValueError(f"refusing to overwrite a skill this plugin did not write: {path}")
+
+
 def validate_maintenance(value: Any, root: Path) -> str:
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise ValueError("unsupported maintenance schema")
@@ -1455,11 +1866,26 @@ def validate_maintenance(value: Any, root: Path) -> str:
             if not isinstance(evidence, list) or len(normalized_evidence) < minimum or any(not isinstance(s, str) or session_storage_id(s) not in known for s in evidence):
                 raise ValueError("insufficient or unknown skill evidence")
         return "autolearn"
-    if set(value) != {"schema", "memory_markdown", "context"}:
+    structured = "memory" in value
+    if structured == ("memory_markdown" in value):
+        raise ValueError("exactly one of memory or memory_markdown is required")
+    if set(value) != ({"schema", "memory", "context"} if structured else {"schema", "memory_markdown", "context"}):
         raise ValueError("unknown consolidation field")
-    context = value.get("context")
-    if not isinstance(value.get("memory_markdown"), str) or len(value["memory_markdown"]) > MAX_MEMORY_CHARS_LIMIT:
+    if structured:
+        memory = value["memory"]
+        if not isinstance(memory, dict) or set(memory) != {str(section["field"]) for section in MEMORY_SECTIONS}:
+            raise ValueError("invalid memory sections")
+        total = 0
+        for section in MEMORY_SECTIONS:
+            entries = memory[section["field"]]
+            if not isinstance(entries, list) or len(entries) > 400 or any(not isinstance(entry, str) for entry in entries):
+                raise ValueError("invalid memory entries")
+            total += sum(len(entry) for entry in entries)
+        if total > MAX_MEMORY_CHARS_LIMIT * 2:
+            raise ValueError("memory sections exceed the accepted size")
+    elif not isinstance(value.get("memory_markdown"), str) or len(value["memory_markdown"]) > MAX_MEMORY_CHARS_LIMIT:
         raise ValueError("invalid memory_markdown")
+    context = value.get("context")
     if not isinstance(context, dict) or set(context) != {"title", "summary", "key_points", "open_tasks"}:
         raise ValueError("invalid context object")
     if not isinstance(context["title"], str) or len(context["title"]) > 160:
@@ -1489,12 +1915,13 @@ def _apply_maintenance_locked(root: Path, request_path: Path, input_path: Path) 
         assert_safe_project_path(root, memory_file(root))
         assert_safe_project_path(root, memory_journal_file(root))
         assert_safe_project_path(root, memory_root(root) / "CONTEXT.md")
-        context_text = "# Context\n\n"
-        context_text += f"## {context['title']}\n\n{context['summary']}\n\n"
-        context_text += "## Key points\n\n" + "\n".join(f"- {item}" for item in context["key_points"]) + "\n\n"
-        context_text += "## Open tasks\n\n" + "\n".join(f"- {item}" for item in context["open_tasks"]) + "\n"
+        context_text, context_dropped = render_context_document(context)
+        if "memory" in value:
+            memory_reply, dropped_items, dropped_samples = render_memory_document(value["memory"], memory_limit(root))
+        else:
+            memory_reply, dropped_items, dropped_samples = value["memory_markdown"], 0, []
         memory_text, journal_text, backup, poisoned, damaged = prepare_memory_write(
-            root, value["memory_markdown"], memory_limit(root)
+            root, memory_reply, memory_limit(root)
         )
         outputs = [
             (memory_journal_file(root), journal_text),
@@ -1504,11 +1931,15 @@ def _apply_maintenance_locked(root: Path, request_path: Path, input_path: Path) 
     else:
         outputs = []
         for item in value["active_skills"]:
-            assert_safe_project_path(root, root / ".agents" / "skills" / item["name"] / "SKILL.md")
-            outputs.append((root / ".agents" / "skills" / item["name"] / "SKILL.md", item["markdown"].rstrip() + "\n"))
+            target = root / ".agents" / "skills" / item["name"] / "SKILL.md"
+            assert_safe_project_path(root, target)
+            assert_skill_is_ours(target)
+            outputs.append((target, with_autolearn_provenance(item["markdown"])))
         for item in value["skill_candidates"]:
-            assert_safe_project_path(root, memory_root(root) / "skill-candidates" / f"{item['name']}.md")
-            outputs.append((memory_root(root) / "skill-candidates" / f"{item['name']}.md", item["markdown"].rstrip() + "\n"))
+            target = memory_root(root) / "skill-candidates" / f"{item['name']}.md"
+            assert_safe_project_path(root, target)
+            assert_skill_is_ours(target)
+            outputs.append((target, with_autolearn_provenance(item["markdown"])))
     atomic_write_many(outputs, journal=memory_root(root) / ".maintenance-transaction.json")
     if kind == "consolidation":
         rotate_memory_journal(root)
@@ -1516,6 +1947,12 @@ def _apply_maintenance_locked(root: Path, request_path: Path, input_path: Path) 
             append_error(root, ValueError(f"memory journal has {damaged} damaged record(s); valid records were preserved"))
         if poisoned:
             append_error(root, ValueError(f"replaced poisoned MEMORY.md; backup kept at {backup}"))
+        if dropped_items:
+            siblings = "entry" if dropped_items == 1 else "entries"
+            sample = "; ".join(dropped_samples)
+            append_error(root, ValueError(f"memory document reached its cap: {dropped_items} {siblings} dropped ({sample})"))
+        if context_dropped:
+            append_error(root, ValueError(f"context sections were clipped: {context_dropped} characters dropped"))
     request["status"] = "consumed"
     request["consumed_at"] = now()
     request["result_kind"] = kind

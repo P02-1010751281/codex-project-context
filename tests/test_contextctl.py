@@ -328,7 +328,7 @@ class ContextCtlTests(unittest.TestCase):
         finally:
             ctl.MEMORY_JOURNAL_ROTATE_BYTES = old_limit
 
-    def test_memory_cap_is_configurable_line_bounded_and_explicit(self):
+    def test_memory_cap_is_configurable_line_bounded_and_keeps_both_ends(self):
         (ctl.memory_root(self.root) / "project-context.json").write_text(json.dumps({"maxMemoryChars": 4_000}))
         request = self.root / "request.json"
         request.write_text(json.dumps({"status": "pending", "request_id": "cap-1"}))
@@ -343,11 +343,157 @@ class ContextCtlTests(unittest.TestCase):
         ctl.apply_maintenance(self.root, request, result)
         rendered = (ctl.memory_root(self.root) / "MEMORY.md").read_text()
         self.assertRegex(rendered, r"_\[memory truncated at 4000 characters: \d+ dropped\]_$")
-        self.assertNotIn("TAIL_SENTINEL", rendered)
+        # The head and the tail both survive; the middle is what the cap drops.
+        self.assertIn("fact 0:", rendered)
+        self.assertIn("TAIL_SENTINEL", rendered)
+        self.assertNotIn("fact 200:", rendered)
         content_before_marker = rendered.split("\n\n_[memory truncated", 1)[0]
         self.assertLessEqual(len(content_before_marker), 4_000)
         self.assertEqual(rendered, ctl.normalize_memory_document(rendered, 4_000))
         self.assertEqual(rendered, ctl.load_memory_document(self.root))
+
+    def test_memory_sections_pool_their_budgets_and_only_the_cap_drops(self):
+        sections = {
+            "project": ["small project entry"],
+            "invariants": [f"invariant {index}: " + "x" * 40 for index in range(40)],
+            "pitfalls": [],
+            "index": [],
+        }
+        text, dropped, samples = ctl.render_memory_document(sections, 4_000)
+        # Invariants needs far more than its 40% share; the idle Project share covers it, so nothing is
+        # dropped while the document itself is below its cap.
+        self.assertEqual(0, dropped)
+        self.assertEqual([], samples)
+        self.assertLessEqual(len(text), 4_000)
+        for section in ctl.MEMORY_SECTIONS:
+            self.assertIn(f"## {section['heading']}", text)
+        self.assertIn("invariant 39:", text)
+
+        huge = {"project": [], "invariants": [f"entry {index} " + "y" * 200 for index in range(200)], "pitfalls": [], "index": []}
+        text, dropped, samples = ctl.render_memory_document(huge, 4_000)
+        self.assertGreater(dropped, 0)
+        self.assertTrue(samples)
+        self.assertLessEqual(len(text), 4_000)
+        self.assertIn(ctl.MEMORY_DROP_NOTE, text)
+        self.assertEqual(text, ctl.normalize_memory_document(text, 4_000))
+
+    def test_structured_memory_reply_is_rendered_into_the_fixed_schema(self):
+        session = ctl.archive_event(self.root, self.payload("UserPromptSubmit", prompt="work"))
+        request = session / "maintenance-request.json"
+        request.write_text(json.dumps({"status": "pending", "request_id": "structured-1"}))
+        result = self.root / "result.json"
+        result.write_text(json.dumps({
+            "schema": "project-context/2",
+            "memory": {
+                "project": ["a codex plugin"],
+                "invariants": ["never write secrets into memory"],
+                "pitfalls": ["a hook that blocks twice loses the turn"],
+                "index": ["scripts/contextctl.py - storage adapter"],
+            },
+            "context": {"title": "T", "summary": "S", "key_points": ["K"], "open_tasks": ["O"]},
+        }))
+        ctl.apply_maintenance(self.root, request, result)
+        memory = (ctl.memory_root(self.root) / "MEMORY.md").read_text()
+        self.assertTrue(memory.startswith("# Project Memory\n\n## Project\n- a codex plugin\n"))
+        for heading in ("## Invariants", "## Pitfalls", "## Index"):
+            self.assertIn(heading, memory)
+        self.assertIn("- never write secrets into memory", memory)
+        self.assertEqual(memory, ctl.load_memory_document(self.root))
+
+        # The two memory shapes are alternatives; sending both is refused.
+        request.write_text(json.dumps({"status": "pending", "request_id": "structured-2"}))
+        result.write_text(json.dumps({
+            "schema": "project-context/2",
+            "memory": {"project": [], "invariants": [], "pitfalls": [], "index": []},
+            "memory_markdown": "both",
+            "context": {"title": "T", "summary": "S", "key_points": [], "open_tasks": []},
+        }))
+        with self.assertRaises(ValueError):
+            ctl.apply_maintenance(self.root, request, result)
+
+    def test_context_document_follows_its_schema_and_reports_a_clip(self):
+        session = ctl.archive_event(self.root, self.payload("UserPromptSubmit", prompt="work"))
+        request = session / "maintenance-request.json"
+        request.write_text(json.dumps({"status": "pending", "request_id": "context-1"}))
+        result = self.root / "result.json"
+        result.write_text(json.dumps({
+            "schema": "project-context/2",
+            "memory_markdown": "facts",
+            "context": {"title": "Session title", "summary": "a summary", "key_points": ["K"], "open_tasks": ["O"]},
+        }))
+        ctl.apply_maintenance(self.root, request, result)
+        context = (ctl.memory_root(self.root) / "CONTEXT.md").read_text()
+        self.assertTrue(context.startswith("# Project Context\n\nLast updated: "))
+        for heading in ("## Summary", "## Key points", "## Open tasks"):
+            self.assertIn(heading, context)
+        self.assertIn("<!-- latest-session-title: Session title -->", context)
+        self.assertNotIn("context truncated", context)
+
+        request.write_text(json.dumps({"status": "pending", "request_id": "context-2"}))
+        result.write_text(json.dumps({
+            "schema": "project-context/2",
+            "memory_markdown": "facts",
+            "context": {"title": "T", "summary": "s", "key_points": [f"point {index} " + "k" * 790 for index in range(50)], "open_tasks": []},
+        }))
+        ctl.apply_maintenance(self.root, request, result)
+        context = (ctl.memory_root(self.root) / "CONTEXT.md").read_text()
+        self.assertRegex(context, r"_\[context truncated: \d+ characters dropped\]_$")
+        self.assertLessEqual(len(context), ctl.MAX_CONTEXT_CHARS)
+        self.assertIn("context sections were clipped", (ctl.memory_root(self.root) / "errors.log").read_text())
+
+    def test_injected_documents_index_their_pointer_sections(self):
+        # The injection spec and the render schema are one table: every heading is either kept or indexed.
+        for spec, sections in ((ctl.MEMORY_INJECTION, ctl.MEMORY_SECTIONS), (ctl.CONTEXT_INJECTION, ctl.CONTEXT_SECTIONS)):
+            headings = {str(section["heading"]) for section in sections}
+            self.assertEqual(headings, set(spec["keep"]) | set(spec["pointers"]))
+
+        (ctl.memory_root(self.root) / "MEMORY.md").write_text(
+            "# Project Memory\n\n"
+            "## Project\n\n- module layout\n\n"
+            "## Invariants\n\n- never write secrets into memory\n\n"
+            "## Pitfalls\n\n- a hook that blocks twice loses the turn\n\n"
+            "## Index\n\n- scripts/contextctl.py - storage adapter\n"
+        )
+        injection = ctl.build_injection(self.root, 20_000)
+        self.assertIn("never write secrets into memory", injection)
+        self.assertIn("a hook that blocks twice loses the turn", injection)
+        self.assertNotIn("- module layout", injection)
+        self.assertNotIn("scripts/contextctl.py - storage adapter", injection)
+        self.assertIn("- `## Project`", injection)
+        self.assertIn("read that file before answering", injection)
+
+        # A document the schema does not describe is injected whole: a degraded shape must not lose text.
+        (ctl.memory_root(self.root) / "MEMORY.md").write_text("# Project Memory\n\nfree form fact\n")
+        self.assertIn("free form fact", ctl.build_injection(self.root, 20_000))
+
+    def test_a_pass_supersedes_only_the_skills_it_wrote(self):
+        ctl.archive_event(self.root, self.payload("UserPromptSubmit", session="s1", prompt="a"))
+        ctl.archive_event(self.root, self.payload("UserPromptSubmit", session="s2", prompt="b"))
+        request = self.root / "request.json"
+        result = self.root / "result.json"
+        skill = self.root / ".agents" / "skills" / "learned-thing" / "SKILL.md"
+        document = "---\nname: learned-thing\ndescription: \"when to use it\"\n---\n\nDo the thing.\n"
+
+        def learn(markdown, name="learned-thing"):
+            request.write_text(json.dumps({"status": "pending", "request_id": f"learn-{name}"}))
+            result.write_text(json.dumps({
+                "schema": "project-context/2",
+                "active_skills": [{"name": name, "markdown": markdown, "evidence_session_ids": ["s1", "s2"]}],
+                "skill_candidates": [],
+            }))
+            return ctl.apply_maintenance(self.root, request, result)
+
+        learn(document)
+        self.assertIn(ctl.AUTOLEARN_PROVENANCE, skill.read_text())
+        learn(document.replace("Do the thing.", "Do the other thing."))
+        self.assertIn("Do the other thing.", skill.read_text())
+
+        handwritten = self.root / ".agents" / "skills" / "hand-written" / "SKILL.md"
+        handwritten.parent.mkdir(parents=True)
+        handwritten.write_text("---\nname: hand-written\ndescription: \"mine\"\n---\n\nMine.\n")
+        with self.assertRaises(ValueError):
+            learn(document, name="hand-written")
+        self.assertIn("Mine.", handwritten.read_text())
 
     def test_hook_wrapper_returns_json_and_writes_project_state(self):
         self.transcript.write_bytes(b"{opaque:true}\n")

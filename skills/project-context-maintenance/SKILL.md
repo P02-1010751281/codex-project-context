@@ -21,16 +21,24 @@ python3 "$PLUGIN_ROOT/scripts/contextctl.py" apply-maintenance \
 
 The result must use `schema: "project-context/2"`.
 
-`MEMORY.md` is a bounded projection, not the session archive. Keep durable facts concise; the
-plugin applies the project `maxMemoryChars` cap at write time, cuts only at line boundaries, and
-leaves an explicit truncation marker. The raw session log remains the source for details.
+`MEMORY.md` is a bounded projection, not the session archive. Its four sections and their headings
+are owned by the plugin, so send the entries and let it render:
+
+`Project` (purpose, stack, structure), `Invariants` (standing decisions, conventions, hard
+constraints, user preferences), `Pitfalls` (operational traps and the lessons behind them), `Index`
+(pointers to docs, source files, and commands).
 
 For consolidation:
 
 ```json
 {
   "schema": "project-context/2",
-  "memory_markdown": "...",
+  "memory": {
+    "project": ["one durable fact per entry"],
+    "invariants": ["..."],
+    "pitfalls": ["..."],
+    "index": ["path - what it owns"]
+  },
   "context": {
     "title": "...",
     "summary": "...",
@@ -39,6 +47,25 @@ For consolidation:
   }
 }
 ```
+
+Rules for the entries:
+
+- Carry forward every entry that is still true; merge duplicates and tighten wording instead of
+  deleting. An entry is dropped only when something else supersedes it or already covers it.
+- Write only this project's own durable facts. Never carry another repository's state or measurements
+  (commit distance, file sizes, key counts) into memory or context.
+- No secrets, no command transcripts, no inline tables or formulas. `Index` entries are pointers, not
+  summaries.
+- `context` is working state: what this session is about, what it found, what is still open. Facts
+  that will outlive the session belong in `memory` instead.
+- The per-section sizes are targets, not caps: the plugin pools what one section leaves unused for the
+  ones that need more, and only the document cap itself drops an entry. Keep `maxMemoryChars` in mind
+  but do not drop a true entry to fit a section.
+
+`memory_markdown` is still accepted for compatibility and is written as a free-form document; prefer
+the structured `memory` shape above so the plugin can render and budget it. Either way the plugin
+cuts at line boundaries, keeps the head and the tail, and leaves an explicit marker when it has to
+clip. The raw session log remains the source for details.
 
 For learning:
 
@@ -54,7 +81,15 @@ For learning:
 }
 ```
 
-An active skill needs evidence from at least two archived sessions; a candidate needs at least one. Invalid schemas are rejected without changing long-term files. Candidates are written below `.agents/memory/skill-candidates/` for later review; active skills are written below `.agents/skills/`.
+An active skill needs evidence from at least two archived sessions; a candidate needs at least one.
+Invalid schemas are rejected without changing long-term files. Candidates are written below
+`.agents/memory/skill-candidates/` for later review; active skills are written below
+`.agents/skills/`.
+
+Each `markdown` value is a complete `SKILL.md` (frontmatter with `name` and `description`, then the
+body). The plugin stamps its provenance marker into the body, and a later pass may only supersede a
+skill that carries that marker: a hand-written skill with the same name is refused, not overwritten.
+Write a new name instead, or leave the skill alone.
 
 If a maintenance attempt must be abandoned, record it and create a new attempt instead of editing the request by hand:
 

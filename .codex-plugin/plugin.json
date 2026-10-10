@@ -1,6 +1,6 @@
 {
   "name": "codex-project-context",
-  "version": "0.4.0+codex.20260922113832",
+  "version": "0.5.0+codex.20261010184024",
   "description": "Project-local context, memory, session archive, migration, and handoff for Codex.",
   "author": {
     "name": "Local developer"
